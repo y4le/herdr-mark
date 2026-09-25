@@ -11,14 +11,14 @@ left.
 
 ## Usage
 
-With the suggested bindings below:
+With the suggested bindings (see [Install](#install); you can change any of them):
 
 | Keys | Action |
 |---|---|
 | `prefix+m` | Mark the focused pane. Press it again on that pane to unmark it; press it on another pane to move the mark there. |
 | `prefix+ctrl+l` / `prefix+ctrl+j` | Join the marked pane **right of** / **below** the focused pane |
 | `prefix+ctrl+h` / `prefix+ctrl+k` | Join the marked pane **left of** / **above** the focused pane |
-| `prefix+shift+s` | Swap the marked pane with the focused pane |
+| `prefix+ctrl+s` | Swap the marked pane with the focused pane |
 
 The marked pane shows **`◆ marked`** as its border title. Each action also shows
 a herdr notification. That matters when the marked pane is the only pane in its
@@ -39,7 +39,8 @@ herdr plugin action list --plugin herdr-mark
 ```
 
 Then bind the actions in `~/.config/herdr/config.toml` and reload the config
-(`prefix+shift+r`):
+(`prefix+shift+r`). The plugin doesn't set any keys itself; these are suggestions,
+and any key that herdr accepts will work:
 
 ```toml
 [[keys.command]]
@@ -73,7 +74,7 @@ command = "herdr-mark.join-up"
 description = "join marked pane above this one"
 
 [[keys.command]]
-key = "prefix+shift+s"
+key = "prefix+ctrl+s"
 type = "plugin_action"
 command = "herdr-mark.swap"
 description = "swap marked pane with this one"
