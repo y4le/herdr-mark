@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+#
+# herdr-mark — tmux-style marked pane for herdr.
+#
+#   herdr-mark toggle        mark the current pane, or unmark it if it is marked
+#   herdr-mark join <dir>    move the marked pane next to the current pane:
+#                            right | down | left | up of it
+#   herdr-mark swap          swap the marked pane with the current pane (same tab)
+#   herdr-mark clear         unmark whatever is marked
+#   herdr-mark get           print the marked pane id (exit 1 if none)
+#
+# The "current pane" is the focused pane when run as a plugin action
+# ($HERDR_PANE_ID) or from a `type = "shell"` binding ($HERDR_ACTIVE_PANE_ID).
+# From a shell inside herdr it is the pane that shell runs in.
+#
+# The mark lives on the pane itself as display-only metadata from the source
+# `user.herdr-mark`: a `mark` token (found again with `pane list`) and a border
+# title (the visible marker). It follows the pane when it moves and disappears
+# when the pane closes, so there is no state file.
+#
+# Options, from the environment or KEY=VALUE lines in
+# $HERDR_PLUGIN_CONFIG_DIR/config (environment wins):
+#   HERDR_MARK_TITLE   border title of the marked pane   (default: "◆ marked")
+#   HERDR_MARK_NOTIFY  1 = show a herdr notification per action, 0 = don't
+#
+# Requires herdr >= 0.9.1 and jq.
+
+set -euo pipefail
+
+SOURCE="user.herdr-mark"
+HERDR="${HERDR_BIN_PATH:-herdr}"
+
+usage() {
+  sed -n '3,10s/^# \{0,1\}//p' "${BASH_SOURCE[0]}" >&2
+  exit 2
+}
+
+load_config() {
+  local file="${HERDR_PLUGIN_CONFIG_DIR:-}/config" key value
+  [[ -n ${HERDR_PLUGIN_CONFIG_DIR:-} && -f $file ]] || return 0
+  while IFS='=' read -r key value; do
+    value=${value%\"}
+    value=${value#\"}
+    case $key in
+      HERDR_MARK_TITLE) : "${HERDR_MARK_TITLE:=$value}" ;;
+      HERDR_MARK_NOTIFY) : "${HERDR_MARK_NOTIFY:=$value}" ;;
+    esac
+  done < <(grep -E '^[A-Z_]+=' "$file" || true)
+}
+
+h() { "$HERDR" "$@"; }
+
+notify() {
+  echo "herdr-mark: $1${2:+: $2}" >&2
+  # A lone pane has no border to carry the marker, so say what happened.
+  [[ $NOTIFY == 1 ]] || return 0
+  h notification show "$1" ${2:+--body "$2"} --sound none >/dev/null 2>&1 || true
+}
+
+fail() {
+  notify "$1" "${2:-}"
+  exit 1
+}
+
+marked_panes() {
+  h pane list | jq -r '.result.panes[] | select(.tokens.mark == "1") | .pane_id'
+}
+
+marked() { marked_panes | head -n1; }
+
+set_mark() {
+  h pane report-metadata "$1" --source "$SOURCE" --title "$TITLE" --token mark=1 >/dev/null
+}
+
+clear_mark() {
+  h pane report-metadata "$1" --source "$SOURCE" --clear-title --clear-token mark \
+    >/dev/null 2>&1 || true
+}
+
+clear_all() {
+  local p
+  while read -r p; do
+    [[ -n $p ]] && clear_mark "$p"
+  done < <(marked_panes)
+}
+
+current_pane() {
+  local p=${HERDR_ACTIVE_PANE_ID:-${HERDR_PANE_ID:-}}
+  if [[ -z $p ]]; then
+    p=$(h pane current | jq -r '.result.pane.pane_id // empty')
+  fi
+  [[ -n $p ]] || fail "No current pane" "run inside herdr"
+  printf '%s\n' "$p"
+}
+
+pane_tab() {
+  h pane get "$1" 2>/dev/null | jq -r '.result.pane.tab_id // empty'
+}
+
+tab_zoomed() {
+  h pane layout --pane "$1" | jq -r '.result.layout.zoomed'
+}
+
+# Sets M/M_TAB (marked) and T/T_TAB (current), refusing up front the cases
+# herdr would ignore: no mark, marked == current, or a zoomed tab.
+resolve() {
+  T=$(current_pane)
+  T_TAB=$(pane_tab "$T")
+  [[ -n $T_TAB ]] || fail "Current pane not found" "$T"
+  M=$(marked)
+  [[ -n $M ]] || fail "No marked pane" "mark one first"
+  [[ $M != "$T" ]] || fail "The marked pane is the current pane" "focus another pane first"
+  M_TAB=$(pane_tab "$M")
+  [[ -n $M_TAB ]] || fail "Marked pane not found" "$M"
+  [[ $(tab_zoomed "$T") == false ]] || fail "This tab is zoomed" "unzoom it first"
+  [[ $(tab_zoomed "$M") == false ]] || fail "The marked pane's tab is zoomed" "unzoom it first"
+}
+
+# try_move <pane move args…>: run `herdr pane move`. On success print the moved
+# pane's id (it changes when the pane enters another workspace); on failure
+# print why and return 1.
+try_move() {
+  local out
+  if ! out=$(h pane move "$@" 2>&1); then
+    printf '%s\n' "${out:-herdr pane move failed}"
+    return 1
+  fi
+  if [[ $(jq -r '.result.move_result.changed' <<<"$out") != true ]]; then
+    jq -r '.result.move_result.reason // "herdr did not move the pane"' <<<"$out"
+    return 1
+  fi
+  jq -r '.result.move_result.pane.pane_id' <<<"$out"
+}
+
+# try_swap <a> <b>: swap two panes in one tab; on failure print why, return 1.
+try_swap() {
+  local out
+  out=$(h pane swap --source-pane "$1" --target-pane "$2" 2>&1) || {
+    printf '%s\n' "${out:-herdr pane swap failed}"
+    return 1
+  }
+  [[ $(jq -r '.result.swap.changed' <<<"$out") == true ]] || {
+    jq -r '.result.swap.reason // "herdr did not swap the panes"' <<<"$out"
+    return 1
+  }
+}
+
+cmd_toggle() {
+  local p m
+  p=$(current_pane)
+  m=$(marked)
+  clear_all
+  if [[ $m == "$p" ]]; then
+    notify "Unmarked $p"
+  else
+    set_mark "$p"
+    notify "Marked $p" "focus another pane, then join or swap"
+  fi
+}
+
+cmd_join() {
+  local dir=${1:-} split out parked=0
+  case $dir in
+    right | left) split=right ;;
+    down | up) split=down ;;
+    *) usage ;;
+  esac
+  resolve
+
+  # herdr ignores a move within one tab (reason "same_tab"), so park the pane
+  # in a new tab first. That tab closes once the pane leaves it, and a pane
+  # keeps its id while it stays in one workspace.
+  if [[ $M_TAB == "$T_TAB" ]]; then
+    out=$(try_move "$M" --new-tab --no-focus) || fail "Couldn't move the marked pane" "$out"
+    M=$out
+    parked=1
+  fi
+
+  if ! out=$(try_move "$M" --tab "$T_TAB" --target-pane "$T" --split "$split" --focus); then
+    ((parked)) || fail "Couldn't join the marked pane" "$out"
+    # The pane is in the parking tab: put it back in its own tab (its old
+    # position is gone) or, failing that, say where it is. It stays marked.
+    if try_move "$M" --tab "$M_TAB" --split right --no-focus >/dev/null; then
+      fail "Couldn't join the marked pane ($out)" "it is back in its tab, still marked"
+    fi
+    fail "Couldn't join the marked pane ($out)" "it is still marked, in tab $(pane_tab "$M")"
+  fi
+  M=$out
+
+  # herdr only splits to the right of or below the target; swap for left/up.
+  if [[ $dir == left || $dir == up ]] && ! out=$(try_swap "$M" "$T"); then
+    fail "Joined $M $split of $T, not $dir" "the swap failed ($out); it is still marked"
+  fi
+
+  clear_mark "$M"
+  notify "Joined $M $dir of $T"
+}
+
+cmd_swap() {
+  local out
+  resolve
+  [[ $M_TAB == "$T_TAB" ]] ||
+    fail "Can't swap across tabs" "herdr only swaps within a tab; use join instead"
+  out=$(try_swap "$M" "$T") || fail "Couldn't swap" "$out"
+  clear_mark "$M"
+  notify "Swapped $M and $T"
+}
+
+main() {
+  command -v jq >/dev/null || { echo "herdr-mark: jq is required" >&2; exit 1; }
+  load_config
+  TITLE=${HERDR_MARK_TITLE:-◆ marked}
+  NOTIFY=${HERDR_MARK_NOTIFY:-1}
+
+  case ${1:-} in
+    toggle) cmd_toggle ;;
+    join) cmd_join "${2:-}" ;;
+    swap) cmd_swap ;;
+    clear) clear_all ;;
+    get)
+      local m
+      m=$(marked)
+      [[ -n $m ]] || exit 1
+      printf '%s\n' "$m"
+      ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"

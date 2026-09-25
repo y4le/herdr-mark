@@ -1,0 +1,51 @@
+id = "herdr-mark"
+name = "Herdr Mark"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "tmux-style marked pane: mark a pane, focus another, then join it beside or swap"
+platforms = ["linux", "macos"]
+
+# Each action acts on the marked pane and the focused pane. Bind them with
+# `type = "plugin_action"` in herdr's config.toml (see README).
+
+[[actions]]
+id = "toggle"
+title = "Mark or unmark this pane"
+contexts = ["pane"]
+command = ["bash", "herdr-mark", "toggle"]
+
+[[actions]]
+id = "join-right"
+title = "Join the marked pane to the right of this pane"
+contexts = ["pane"]
+command = ["bash", "herdr-mark", "join", "right"]
+
+[[actions]]
+id = "join-down"
+title = "Join the marked pane below this pane"
+contexts = ["pane"]
+command = ["bash", "herdr-mark", "join", "down"]
+
+[[actions]]
+id = "join-left"
+title = "Join the marked pane to the left of this pane"
+contexts = ["pane"]
+command = ["bash", "herdr-mark", "join", "left"]
+
+[[actions]]
+id = "join-up"
+title = "Join the marked pane above this pane"
+contexts = ["pane"]
+command = ["bash", "herdr-mark", "join", "up"]
+
+[[actions]]
+id = "swap"
+title = "Swap the marked pane with this pane"
+contexts = ["pane"]
+command = ["bash", "herdr-mark", "swap"]
+
+[[actions]]
+id = "clear"
+title = "Unmark the marked pane"
+contexts = ["global"]
+command = ["bash", "herdr-mark", "clear"]
