@@ -1,6 +1,6 @@
 id = "herdr-mark"
 name = "Herdr Mark"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.1"
 description = "tmux-style marked pane: mark a pane, focus another, then join it beside or swap"
 platforms = ["linux", "macos"]

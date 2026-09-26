@@ -25,9 +25,9 @@ a herdr notification. That matters when the marked pane is the only pane in its
 tab, because herdr draws no border around a lone pane (`pane_borders = "auto"`).
 
 After a join or swap, focus goes to the pane you marked and the mark is cleared.
-Joins work across tabs and workspaces. Moving a pane into another workspace gives
-it a new pane id. Swaps only work within one tab, because herdr refuses to swap
-across tabs; use a join instead.
+Both actions work across tabs and workspaces. Moving a pane into another
+workspace gives it a new pane id. A cross-tab swap preserves both tabs' split
+shape and ratios while exchanging the two panes' positions.
 
 ## Install
 
@@ -118,13 +118,27 @@ variables with the same names override the file.
   closes once it's empty, and the pane keeps its id.
 - **Left and up are a join plus a swap.** herdr can only split right of or below a
   target, so the script does that split and then swaps the two panes.
+- **Swaps across tabs use moves.** Herdr's `pane swap` only accepts panes in one
+  tab. When at least one tab has multiple panes, the script chooses a pane that
+  can leave without losing its original split, moves both panes, and uses up to
+  two same-tab swaps to restore their positions. If both tabs have just one pane,
+  it briefly creates a shell pane to keep the first tab and workspace open while
+  the panes cross, then closes that shell. A cross-workspace swap assigns new ids
+  to both panes; their running processes continue.
 - **Failures leave the mark in place and say what happened.** The cases herdr
   would ignore are refused before anything moves: no pane is marked, the marked
   pane is the focused one, or either tab is zoomed. If the second move of a
   same-tab join still fails, the script moves the pane from the temporary tab back
   into its own tab (its exact position there is lost). If that fails too, it
   reports which tab the pane is in. If the swap in a left/up join is refused, it
-  reports the side the pane actually ended up on.
+  reports the side the pane actually ended up on. For a cross-tab swap, it tries
+  to restore the original layout if a move fails. If recovery also fails, the
+  message identifies the remaining panes and the mark stays in place. An
+  interrupted operation can leave an intermediate layout; the temporary pane
+  carries a `swap_helper` token and the other participant carries a `swap-peer`
+  token so they can be found after recovery. A new swap is refused while either
+  token remains. After repairing the layout, `herdr-mark clear` removes the mark
+  and peer token; close any leftover temporary pane explicitly.
 
 The script also runs outside a keybinding. `herdr-mark toggle | join <dir> | swap
 | clear | get` acts on `$HERDR_PANE_ID`, which is the pane your shell is in. It
@@ -138,9 +152,9 @@ make check            # shellcheck, manifest, offline tests against a mock herdr
 make live             # live tests against the running herdr server
 ```
 
-`make live` builds layouts in unfocused scratch workspaces, checks the geometry
-after every join and swap, and closes the scratch workspaces afterwards. It doesn't
-change your focus or your other workspaces.
+`make live` builds layouts in scratch workspaces, checks joins and swaps across
+tabs and workspaces, then closes the scratch workspaces and restores the previously
+focused workspace.
 
 ## License
 

@@ -5,7 +5,7 @@
 #   herdr-mark toggle        mark the current pane, or unmark it if it is marked
 #   herdr-mark join <dir>    move the marked pane next to the current pane:
 #                            right | down | left | up of it
-#   herdr-mark swap          swap the marked pane with the current pane (same tab)
+#   herdr-mark swap          swap the marked pane with the current pane
 #   herdr-mark clear         unmark whatever is marked
 #   herdr-mark get           print the marked pane id (exit 1 if none)
 #
@@ -58,8 +58,20 @@ notify() {
 }
 
 fail() {
+  restore_view
   notify "$1" "${2:-}"
   exit 1
+}
+
+restore_view() {
+  [[ -n ${RESTORE_WS:-} ]] || return 0
+  local current current_ws current_tab
+  current=$(h api snapshot 2>/dev/null) || return 0
+  current_ws=$(jq -r '.result.snapshot.focused_workspace_id // empty' <<<"$current")
+  current_tab=$(jq -r '.result.snapshot.focused_tab_id // empty' <<<"$current")
+  [[ $current_ws == "$RESTORE_WS" ]] || h workspace focus "$RESTORE_WS" >/dev/null 2>&1 || true
+  [[ -z ${RESTORE_TAB:-} || $current_tab == "$RESTORE_TAB" ]] ||
+    h tab focus "$RESTORE_TAB" >/dev/null 2>&1 || true
 }
 
 marked_panes() {
@@ -145,6 +157,76 @@ try_swap() {
   }
 }
 
+try_split() {
+  local out
+  out=$(h pane split "$1" --direction down --no-focus 2>&1) || {
+    printf '%s\n' "${out:-herdr pane split failed}"
+    return 1
+  }
+  jq -r '.result.pane.pane_id // empty' <<<"$out"
+}
+
+try_close() {
+  h pane close "$1" >/dev/null 2>&1
+}
+
+# A peer token makes the second participant discoverable if a move changes its
+# public id before an interrupted swap can clear it.
+set_peer() {
+  h pane report-metadata "$1" --source "$SOURCE" --token swap-peer=1 >/dev/null
+}
+
+clear_peer() {
+  h pane report-metadata "$1" --source "$SOURCE" --clear-token swap-peer >/dev/null 2>&1 || true
+}
+
+clear_peers() {
+  local p
+  while read -r p; do
+    [[ -n $p ]] && clear_peer "$p"
+  done < <(h pane list | jq -r '.result.panes[] | select(.tokens["swap-peer"] == "1") | .pane_id')
+}
+
+# plan_leaver <layout JSON> <pane id>: print kind, anchor, direction, ratio,
+# fixup pane, and cost as TSV. A move removes a leaf and collapses its parent.
+# The smallest split rectangle containing that leaf is its parent. A split
+# containing exactly two leaves is a cherry that can be rebuilt by one move.
+plan_leaver() {
+  jq -er --arg id "$2" '
+    def inside($a; $b):
+      $a.x >= $b.x and $a.y >= $b.y and
+      ($a.x + $a.width) <= ($b.x + $b.width) and
+      ($a.y + $a.height) <= ($b.y + $b.height);
+    .result.layout as $l
+    | ($l.panes | map(select(.pane_id == $id)) | first) as $p
+    | if $p == null or ($l.splits | length) != (($l.panes | length) - 1)
+         or any($l.panes[]; .rect.width <= 0 or .rect.height <= 0)
+      then error("invalid pane layout") else . end
+    | [$l.splits[] | select(inside($p.rect; .rect))] as $parents
+    | if ($parents | length) == 0 then error("pane has no parent split") else . end
+    | ($parents | min_by(.rect.width * .rect.height)) as $parent
+    | [$l.panes[] | select(.pane_id != $id and inside(.rect; $parent.rect))] as $siblings
+    | if ($siblings | length) == 1 then
+        ($siblings[0].pane_id) as $s
+        | (if $parent.direction == "right" then $p.rect.x == $parent.rect.x
+           else $p.rect.y == $parent.rect.y end) as $first
+        | [if $first then "leaf-first" else "leaf-second" end,
+           $s, $parent.direction, ($parent.ratio | tostring), $s,
+           (if $first then 1 else 0 end)] | @tsv
+      else
+        [ $l.splits[] as $split
+          | [$l.panes[] | select(inside(.rect; $split.rect))] as $members
+          | select($members | length == 2)
+          | ($members | sort_by(if $split.direction == "right" then .rect.x else .rect.y end)) as $pair
+          | [$pair[0].pane_id, $pair[1].pane_id, $split.direction,
+             ($split.ratio | tostring)]
+        ] | first as $cherry
+        | if $cherry == null then error("no cherry in pane layout") else . end
+        | ["cherry", $cherry[0], $cherry[2], $cherry[3], $cherry[1], 2] | @tsv
+      end
+  ' <<<"$1"
+}
+
 cmd_toggle() {
   local p m
   p=$(current_pane)
@@ -197,12 +279,128 @@ cmd_join() {
 }
 
 cmd_swap() {
-  local out
+  local out m_layout t_layout m_count t_count m_plan t_plan
+  local kind anchor dir ratio fixup _cost x p_tab q_tab rollback rollback_reason="" inventory
+  local p_focus q_focus leaver_marked=1
   resolve
-  [[ $M_TAB == "$T_TAB" ]] ||
-    fail "Can't swap across tabs" "herdr only swaps within a tab; use join instead"
-  out=$(try_swap "$M" "$T") || fail "Couldn't swap" "$out"
+  if [[ $M_TAB == "$T_TAB" ]]; then
+    out=$(try_swap "$M" "$T") || fail "Couldn't swap" "$out"
+    clear_mark "$M"
+    notify "Swapped $M and $T"
+    return
+  fi
+
+  local view
+  view=$(h api snapshot) || fail "Couldn't inspect the focused workspace"
+  RESTORE_WS=$(jq -r '.result.snapshot.focused_workspace_id // empty' <<<"$view")
+  RESTORE_TAB=$(jq -r '.result.snapshot.focused_tab_id // empty' <<<"$view")
+  [[ -n $RESTORE_WS ]] || fail "Couldn't inspect the focused workspace"
+
+  m_layout=$(h pane layout --pane "$M") || fail "Couldn't inspect the marked pane's layout"
+  t_layout=$(h pane layout --pane "$T") || fail "Couldn't inspect the current pane's layout"
+  m_count=$(jq '.result.layout.panes | length' <<<"$m_layout")
+  t_count=$(jq '.result.layout.panes | length' <<<"$t_layout")
+  [[ $m_count -ge 1 && $t_count -ge 1 ]] || fail "Couldn't inspect both pane layouts"
+  inventory=$(h pane list) || fail "Couldn't inspect panes before swapping"
+  if jq -e '.result.panes[] | select(.tokens.swap_helper == "1" or .tokens["swap-peer"] == "1")' <<<"$inventory" >/dev/null; then
+    fail "An earlier swap is unfinished" "recover its panes, then run herdr-mark clear before swapping again"
+  fi
+  set_peer "$T" || fail "Couldn't mark the swap peer" "$T"
+
+  # Two lone panes need a temporary leaf to keep the marked tab (and possibly
+  # its workspace) alive while the marked pane moves out.
+  if ((m_count == 1 && t_count == 1)); then
+    x=$(try_split "$M") || { clear_peer "$T"; fail "Couldn't create a temporary pane" "$x"; }
+    [[ -n $x ]] || { clear_peer "$T"; fail "Herdr didn't return a temporary pane id"; }
+    if ! h pane report-metadata "$x" --source "$SOURCE" --token swap_helper=1 >/dev/null; then
+      try_close "$x" || true
+      clear_peer "$T"
+      fail "Couldn't tag the temporary pane" "$x"
+    fi
+    if ! out=$(try_move "$M" --tab "$T_TAB" --target-pane "$T" --split right --focus); then
+      try_close "$x" || true
+      clear_peer "$T"
+      fail "Couldn't move the marked pane" "$out"
+    fi
+    M=$out
+    if ! out=$(try_move "$T" --tab "$M_TAB" --target-pane "$x" --split right --no-focus); then
+      if rollback=$(try_move "$M" --tab "$M_TAB" --target-pane "$x" --split right --no-focus); then
+        M=$rollback
+        if try_close "$x"; then
+          clear_peer "$T"
+          fail "Couldn't move the swap peer ($out)" "original layout restored; $M is still marked"
+        fi
+        fail "Couldn't move the swap peer ($out)" "recovery returned $M, but temporary pane $x could not be closed"
+      fi
+      fail "Couldn't move the swap peer ($out)" "recovery move failed ($rollback); $M is marked and temporary pane $x remains"
+    fi
+    T=$out
+    if ! try_close "$x" && ! try_close "$x"; then
+      fail "The panes moved, but the temporary pane could not be closed" "$x; $M is still marked"
+    fi
+  else
+    if ((m_count > 1)); then
+      m_plan=$(plan_leaver "$m_layout" "$M") || { clear_peer "$T"; fail "Couldn't plan the marked pane's move"; }
+    fi
+    if ((t_count > 1)); then
+      t_plan=$(plan_leaver "$t_layout" "$T") || { clear_peer "$T"; fail "Couldn't plan the current pane's move"; }
+    fi
+    if ((m_count > 1)) && { ((t_count == 1)) || [[ ${m_plan##*$'\t'} -le ${t_plan##*$'\t'} ]]; }; then
+      IFS=$'\t' read -r kind anchor dir ratio fixup _cost <<<"$m_plan"
+      P=$M Q=$T p_tab=$M_TAB q_tab=$T_TAB
+    else
+      IFS=$'\t' read -r kind anchor dir ratio fixup _cost <<<"$t_plan"
+      P=$T Q=$M p_tab=$T_TAB q_tab=$M_TAB
+      leaver_marked=0
+    fi
+    p_focus=--no-focus q_focus=--no-focus
+    ((leaver_marked)) && p_focus=--focus || q_focus=--focus
+
+    if [[ $kind == cherry ]] && ! out=$(try_swap "$P" "$fixup"); then
+      clear_peer "$T"
+      fail "Couldn't prepare the swap" "$out"
+    fi
+    if ! out=$(try_move "$P" --tab "$q_tab" --target-pane "$Q" --split right "$p_focus"); then
+      if [[ $kind == cherry ]] && ! rollback_reason=$(try_swap "$P" "$fixup"); then
+        fail "Couldn't move the pane ($out)" "the setup swap could not be undone ($rollback_reason); $M is still marked"
+      fi
+      clear_peer "$T"
+      fail "Couldn't move the pane" "$out"
+    fi
+    P=$out
+    if ! out=$(try_move "$Q" --tab "$p_tab" --target-pane "$anchor" --split "$dir" --ratio "$ratio" "$q_focus"); then
+      if rollback=$(try_move "$P" --tab "$p_tab" --target-pane "$anchor" --split "$dir" --ratio "$ratio" --no-focus); then
+        P=$rollback
+        if [[ $kind == leaf-second ]] || rollback_reason=$(try_swap "$P" "$fixup"); then
+          ((leaver_marked)) && M=$P || T=$P
+          clear_peer "$T"
+          fail "Couldn't move the second pane ($out)" "original layout restored; $M is still marked"
+        fi
+      else
+        rollback_reason=$rollback
+      fi
+      ((leaver_marked)) && M=$P || T=$P
+      fail "Couldn't move the second pane ($out)" "recovery failed${rollback_reason:+ ($rollback_reason)}; $M is still marked"
+    fi
+    Q=$out
+    if ((leaver_marked)); then
+      M=$P T=$Q
+    else
+      M=$Q T=$P
+    fi
+    if [[ $kind != leaf-second ]]; then
+      if ! out=$(try_swap "$Q" "$fixup") && ! out=$(try_swap "$Q" "$fixup"); then
+        fail "The panes moved, but their positions need one more swap" \
+          "$Q and $fixup in tab $p_tab; $M is still marked ($out)"
+      fi
+    fi
+  fi
+
+  # --focus selects the marked pane. A caller testing an unfocused workspace
+  # should not be pulled away from the workspace they were viewing.
+  restore_view
   clear_mark "$M"
+  clear_peer "$T"
   notify "Swapped $M and $T"
 }
 
@@ -216,7 +414,7 @@ main() {
     toggle) cmd_toggle ;;
     join) cmd_join "${2:-}" ;;
     swap) cmd_swap ;;
-    clear) clear_all ;;
+    clear) clear_all; clear_peers ;;
     get)
       local m
       m=$(marked)

@@ -24,9 +24,19 @@ reset() {
   cat >"$HERDR_MARK_TEST_STATE" <<'EOF'
 {
   "focused": "w1:p2",
+  "view_workspace": "w1",
+  "view_tab": "w1:t1",
   "next": 10,
   "moves": 0,
+  "swaps": 0,
+  "splits": 0,
+  "closes": 0,
   "zoomed_tabs": [],
+  "trees": {
+    "w1:t1": {"d": "right", "r": 0.5, "a": "w1:p1", "b": "w1:p2"},
+    "w1:t2": "w1:p3",
+    "w2:t1": "w2:p4"
+  },
   "panes": [
     {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1", "tokens": {}, "title": null},
     {"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1", "tokens": {}, "title": null},
@@ -68,6 +78,14 @@ field() {
 
 marked_ids() {
   jq -r '[.panes[] | select(.tokens.mark == "1") | .pane_id] | join(" ")' "$HERDR_MARK_TEST_STATE"
+}
+
+tree() {
+  jq -r --arg tab "$1" '
+    def show: if type == "string" then .
+      else (.d[0:1] + (.r | tostring) + "(" + (.a | show) + "," + (.b | show) + ")") end;
+    .trees[$tab] | if . == null then "missing" else show end
+  ' "$HERDR_MARK_TEST_STATE"
 }
 
 check() {
@@ -213,12 +231,152 @@ check rc "$rc" 0
 check swap "$(called "pane swap --source-pane w1:p1 --target-pane w1:p2")" yes
 check marked "$(marked_ids)" ""
 
-t "swap across tabs is refused and keeps the mark"
+t "swap across tabs exchanges exact positions without a helper"
 mark w1:p3
 on w1:p2 swap
-check rc "$rc" 1
+check rc "$rc" 0
 check swap "$(calls_matching "pane swap")" 0
+check moves "$(calls_matching "pane move")" 2
+check helper "$(calls_matching "pane split")" 0
+check tree "$(tree w1:t1)" 'r0.5(w1:p1,w1:p3)'
+check tree "$(tree w1:t2)" w1:p2
+check marked "$(marked_ids)" ""
+check viewed_tab "$(jq -r .view_tab "$HERDR_MARK_TEST_STATE")" w1:t1
+
+t "cross-workspace swap keeps both layouts and remaps both ids"
+mark w1:p1
+on w2:p4 swap
+check rc "$rc" 0
+moved_m=$(jq -r '.panes[] | select(.workspace_id == "w2") | .pane_id' "$HERDR_MARK_TEST_STATE")
+moved_t=$(jq -r '.panes[] | select(.workspace_id == "w1" and .pane_id != "w1:p2" and .pane_id != "w1:p3") | .pane_id' "$HERDR_MARK_TEST_STATE")
+check tree "$(tree w1:t1)" "r0.5($moved_t,w1:p2)"
+check tree "$(tree w2:t1)" "$moved_m"
+check swaps "$(calls_matching "pane swap")" 1
+check helper "$(calls_matching "pane split")" 0
+check marked "$(marked_ids)" ""
+check peers "$(jq '[.panes[] | select(.tokens["swap-peer"] == "1")] | length' "$HERDR_MARK_TEST_STATE")" 0
+check view "$(jq -r .view_workspace "$HERDR_MARK_TEST_STATE")" w1
+
+t "cherry plan exchanges panes without disturbing a nested split"
+next=$(jq '.trees["w1:t1"] = {d:"right",r:0.3,a:"w1:p1",b:{d:"down",r:0.7,a:"w1:p2",b:"w1:p3"}}
+  | del(.trees["w1:t2"])
+  | (.panes[] | select(.pane_id == "w1:p3") | .tab_id) = "w1:t1"' "$HERDR_MARK_TEST_STATE")
+printf '%s\n' "$next" >"$HERDR_MARK_TEST_STATE"
+mark w1:p1
+on w2:p4 swap
+check rc "$rc" 0
+moved_m=$(jq -r '.panes[] | select(.workspace_id == "w2") | .pane_id' "$HERDR_MARK_TEST_STATE")
+moved_t=$(jq -r '.panes[] | select(.workspace_id == "w1" and .pane_id != "w1:p2" and .pane_id != "w1:p3") | .pane_id' "$HERDR_MARK_TEST_STATE")
+check tree "$(tree w1:t1)" "r0.3($moved_t,d0.7(w1:p2,w1:p3))"
+check tree "$(tree w2:t1)" "$moved_m"
+check swaps "$(calls_matching "pane swap")" 2
+check helper "$(calls_matching "pane split")" 0
+
+t "two lone panes use a temporary helper and keep both tabs"
+mark w1:p3
+on w2:p4 swap
+check rc "$rc" 0
+check helper "$(calls_matching "pane split")" 1
+check close "$(calls_matching "pane close")" 1
+check moves "$(calls_matching "pane move")" 2
+check swaps "$(calls_matching "pane swap")" 0
+check tabs "$(jq '.trees | length' "$HERDR_MARK_TEST_STATE")" 3
+check helpers "$(jq '[.panes[] | select(.tokens.swap_helper == "1")] | length' "$HERDR_MARK_TEST_STATE")" 0
+check marked "$(marked_ids)" ""
+
+t "a refused second move restores the layout and keeps the mark"
+mark w1:p1
+HERDR_MARK_TEST_FAIL_MOVES=2 on w2:p4 swap
+check rc "$rc" 1
+recovered=$(marked_ids)
+check tree "$(tree w1:t1)" "r0.5($recovered,w1:p2)"
+check tree "$(tree w2:t1)" w2:p4
+check "marked workspace" "${recovered%%:*}" w1
+
+t "an unfinished peer token blocks another swap until clear"
+mark w1:p1
+next=$(jq '(.panes[] | select(.pane_id == "w2:p4") | .tokens["swap-peer"]) = "1"' "$HERDR_MARK_TEST_STATE")
+printf '%s\n' "$next" >"$HERDR_MARK_TEST_STATE"
+on w2:p4 swap
+check rc "$rc" 1
+check moves "$(calls_matching "pane move")" 0
+on w2:p4 clear
+check peers "$(jq '[.panes[] | select(.tokens["swap-peer"] == "1")] | length' "$HERDR_MARK_TEST_STATE")" 0
+check marked "$(marked_ids)" ""
+check peers "$(jq '[.panes[] | select(.tokens["swap-peer"] == "1")] | length' "$HERDR_MARK_TEST_STATE")" 0
+
+t "a refused helper move restores the layout and closes the helper"
+mark w1:p3
+HERDR_MARK_TEST_FAIL_MOVES=2 on w2:p4 swap
+check rc "$rc" 1
+recovered=$(marked_ids)
+check tree "$(tree w1:t2)" "$recovered"
+check tree "$(tree w2:t1)" w2:p4
+check helpers "$(jq '[.panes[] | select(.tokens.swap_helper == "1")] | length' "$HERDR_MARK_TEST_STATE")" 0
+check "marked workspace" "${recovered%%:*}" w1
+
+t "a refused helper split leaves both panes untouched"
+mark w1:p3
+HERDR_MARK_TEST_FAIL_SPLITS=1 on w2:p4 swap
+check rc "$rc" 1
+check moves "$(calls_matching "pane move")" 0
+check tree "$(tree w1:t2)" w1:p3
+check tree "$(tree w2:t1)" w2:p4
 check marked "$(marked_ids)" w1:p3
+check peers "$(jq '[.panes[] | select(.tokens["swap-peer"] == "1")] | length' "$HERDR_MARK_TEST_STATE")" 0
+
+t "a failed helper close retains the mark and identifies the helper"
+mark w1:p3
+HERDR_MARK_TEST_FAIL_CLOSES="1 2" on w2:p4 swap
+check rc "$rc" 1
+check closes "$(calls_matching "pane close")" 2
+check helpers "$(jq '[.panes[] | select(.tokens.swap_helper == "1")] | length' "$HERDR_MARK_TEST_STATE")" 1
+check marked_count "$(jq '[.panes[] | select(.tokens.mark == "1")] | length' "$HERDR_MARK_TEST_STATE")" 1
+check message "$(grep -c "temporary pane could not be closed" "$tmp/stderr")" 1
+
+t "a refused cherry setup swap leaves its layout untouched"
+next=$(jq '.trees["w1:t1"] = {d:"right",r:0.3,a:"w1:p1",b:{d:"down",r:0.7,a:"w1:p2",b:"w1:p3"}}
+  | del(.trees["w1:t2"])
+  | (.panes[] | select(.pane_id == "w1:p3") | .tab_id) = "w1:t1"' "$HERDR_MARK_TEST_STATE")
+printf '%s\n' "$next" >"$HERDR_MARK_TEST_STATE"
+mark w1:p1
+HERDR_MARK_TEST_FAIL_SWAPS=1 on w2:p4 swap
+check rc "$rc" 1
+check tree "$(tree w1:t1)" 'r0.3(w1:p1,d0.7(w1:p2,w1:p3))'
+check moves "$(calls_matching "pane move")" 0
+check marked "$(marked_ids)" w1:p1
+
+t "a refused final fixup keeps the mark and reports the displaced pane"
+mark w1:p1
+HERDR_MARK_TEST_FAIL_SWAPS="1 2" on w2:p4 swap
+check rc "$rc" 1
+check moves "$(calls_matching "pane move")" 2
+check swaps "$(calls_matching "pane swap")" 2
+check marked_count "$(jq '[.panes[] | select(.tokens.mark == "1")] | length' "$HERDR_MARK_TEST_STATE")" 1
+check message "$(grep -c "positions need one more swap" "$tmp/stderr")" 1
+check peers "$(jq '[.panes[] | select(.tokens["swap-peer"] == "1")] | length' "$HERDR_MARK_TEST_STATE")" 1
+on w2:p4 clear
+check peers_cleared "$(jq '[.panes[] | select(.tokens["swap-peer"] == "1")] | length' "$HERDR_MARK_TEST_STATE")" 0
+
+t "a refused rollback leaves the moved pane marked for manual recovery"
+mark w1:p1
+HERDR_MARK_TEST_FAIL_MOVES="2 3" on w2:p4 swap
+check rc "$rc" 1
+check moves "$(calls_matching "pane move")" 3
+recovered=$(marked_ids)
+check marked_ws "${recovered%%:*}" w2
+check marked_count "$(jq '[.panes[] | select(.tokens.mark == "1")] | length' "$HERDR_MARK_TEST_STATE")" 1
+check message "$(grep -c "recovery failed" "$tmp/stderr")" 1
+check "error names marked pane" "$(grep -Fc "$recovered is still marked" "$tmp/stderr")" 1
+
+t "a refused helper rollback names the still-marked pane"
+mark w1:p3
+HERDR_MARK_TEST_FAIL_MOVES="2 3" on w2:p4 swap
+check rc "$rc" 1
+recovered=$(marked_ids)
+check marked_ws "${recovered%%:*}" w2
+check "error names marked pane" "$(grep -Fc "$recovered is marked" "$tmp/stderr")" 1
+check helpers "$(jq '[.panes[] | select(.tokens.swap_helper == "1")] | length' "$HERDR_MARK_TEST_STATE")" 1
 
 for case in "no mark" "marked is current" "current tab zoomed" "marked tab zoomed"; do
   t "join refuses: $case"
